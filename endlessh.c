@@ -1,4 +1,13 @@
-#define _POSIX_C_SOURCE 200809L
+/* Endlessh: an SSH tarpit
+ *
+ * This is free and unencumbered software released into the public domain.
+ */
+#if defined(__OpenBSD__)
+#  define _BSD_SOURCE  /* for pledge(2) and unveil(2) */
+#else
+#  define _XOPEN_SOURCE 600
+#endif
+
 #include <time.h>
 #include <errno.h>
 #include <stdio.h>
@@ -9,25 +18,33 @@
 #include <string.h>
 
 #include <poll.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
-#define ENDLESSH_VERSION           0.1
+#define ENDLESSH_VERSION           1.0
 
 #define DEFAULT_PORT              2222
 #define DEFAULT_DELAY            10000  /* milliseconds */
 #define DEFAULT_MAX_LINE_LENGTH     32
 #define DEFAULT_MAX_CLIENTS       4096
-#define DEFAULT_CONFIG_FILE      "/etc/endlessh/config"
+
+#if defined(__FreeBSD__)
+#  define DEFAULT_CONFIG_FILE "/usr/local/etc/endlessh.config"
+#else
+#  define DEFAULT_CONFIG_FILE "/etc/endlessh/config"
+#endif
+
+#define DEFAULT_BIND_FAMILY  AF_UNSPEC
 
 #define XSTR(s) STR(s)
 #define STR(s) #s
 
 static long long
-uepoch(void)
+epochms(void)
 {
     struct timespec tv;
     clock_gettime(CLOCK_REALTIME, &tv);
@@ -47,7 +64,7 @@ logmsg(enum loglevel level, const char *format, ...)
         int save = errno;
 
         /* Print a timestamp */
-        long long now = uepoch();
+        long long now = epochms();
         time_t t = now / 1000;
         char date[64];
         struct tm tm[1];
@@ -65,6 +82,12 @@ logmsg(enum loglevel level, const char *format, ...)
     }
 }
 
+struct {
+    long long connects;
+    long long milliseconds;
+    long long bytes_sent;
+} statistics;
+
 struct client {
     char ipaddr[INET6_ADDRSTRLEN];
     long long connect_time;
@@ -81,11 +104,12 @@ client_new(int fd, long long send_next)
     struct client *c = malloc(sizeof(*c));
     if (c) {
         c->ipaddr[0] = 0;
-        c->connect_time = uepoch();
+        c->connect_time = epochms();
         c->send_next = send_next;
         c->bytes_sent = 0;
         c->next = 0;
         c->fd = fd;
+        c->port = 0;
 
         /* Set the smallest possible recieve buffer. This reduces local
          * resource usage and slows down the remote end.
@@ -120,59 +144,57 @@ static void
 client_destroy(struct client *client)
 {
     logmsg(LOG_DEBUG, "close(%d)", client->fd);
-    long long dt = uepoch() - client->connect_time;
+    long long dt = epochms() - client->connect_time;
     logmsg(LOG_INFO,
             "CLOSE host=%s port=%d fd=%d "
             "time=%lld.%03lld bytes=%lld",
             client->ipaddr, client->port, client->fd,
             dt / 1000, dt % 1000,
             client->bytes_sent);
+    statistics.milliseconds += dt;
     close(client->fd);
     free(client);
 }
 
-struct queue {
+static void
+statistics_log_totals(struct client *clients)
+{
+    long long milliseconds = statistics.milliseconds;
+    for (long long now = epochms(); clients; clients = clients->next)
+        milliseconds += now - clients->connect_time;
+    logmsg(LOG_INFO, "TOTALS connects=%lld seconds=%lld.%03lld bytes=%lld",
+           statistics.connects,
+           milliseconds / 1000,
+           milliseconds % 1000,
+           statistics.bytes_sent);
+}
+
+struct fifo {
     struct client *head;
     struct client *tail;
     int length;
 };
 
 static void
-queue_init(struct queue *q)
+fifo_init(struct fifo *q)
 {
     q->head = q->tail = 0;
     q->length = 0;
 }
 
 static struct client *
-queue_remove(struct queue *q, int fd)
+fifo_pop(struct fifo *q)
 {
-    /* Yes, this is a linear search, but the element we're looking for
-     * is virtually always one of the first few elements.
-     */
-    struct client *c;
-    struct client *prev = 0;
-    for (c = q->head; c; prev = c, c = c->next) {
-        if (c->fd == fd) {
-            if (!--q->length) {
-                q->head = q->tail = 0;
-            } else if (q->tail == c) {
-                q->tail = prev;
-                prev->next = 0;
-            } else if (prev) {
-                prev->next = c->next;
-            } else {
-                q->head = c->next;
-            }
-            c->next = 0;
-            break;
-        }
-    }
-    return c;
+    struct client *removed = q->head;
+    q->head = q->head->next;
+    removed->next = 0;
+    if (!--q->length)
+        q->tail = 0;
+    return removed;
 }
 
 static void
-queue_append(struct queue *q, struct client *c)
+fifo_append(struct fifo *q, struct client *c)
 {
     if (!q->tail) {
         q->head = q->tail = c;
@@ -184,7 +206,7 @@ queue_append(struct queue *q, struct client *c)
 }
 
 static void
-queue_destroy(struct queue *q)
+fifo_destroy(struct fifo *q)
 {
     struct client *c = q->head;
     while (c) {
@@ -194,56 +216,6 @@ queue_destroy(struct queue *q)
     }
     q->head = q->tail = 0;
     q->length = 0;
-}
-
-struct pollvec {
-    size_t cap;
-    size_t fill;
-    struct pollfd *fds;
-};
-
-static void
-pollvec_init(struct pollvec *v)
-{
-    v->cap = 4;
-    v->fill = 0;
-    v->fds = malloc(v->cap * sizeof(v->fds[0]));
-    if (!v->fds) {
-        fprintf(stderr, "endlessh: pollvec initialization failed\n");
-        exit(EXIT_FAILURE);
-    }
-}
-
-static void
-pollvec_clear(struct pollvec *v)
-{
-    v->fill = 0;
-}
-
-static int
-pollvec_push(struct pollvec *v, int fd, short events)
-{
-    if (v->cap == v->fill) {
-        size_t size = v->cap * 2 * sizeof(v->fds[0]);
-        if (size < v->cap * sizeof(v->fds[0]))
-            return 0; // overflow
-        struct pollfd *grow = realloc(v->fds, size);
-        if (!grow)
-            return 0;
-        v->fds = grow;
-        v->cap *= 2;
-    }
-    v->fds[v->fill].fd = fd;
-    v->fds[v->fill].events = events;
-    v->fill++;
-    return 1;
-}
-
-static void
-pollvec_free(struct pollvec *v)
-{
-    free(v->fds);
-    v->fds = 0;
 }
 
 static void
@@ -291,11 +263,21 @@ sighup_handler(int signal)
     reload = 1;
 }
 
+static volatile sig_atomic_t dumpstats = 0;
+
+static void
+sigusr1_handler(int signal)
+{
+    (void)signal;
+    dumpstats = 1;
+}
+
 struct config {
     int port;
     int delay;
     int max_line_length;
     int max_clients;
+    int bind_family;
 };
 
 #define CONFIG_DEFAULT { \
@@ -303,6 +285,7 @@ struct config {
     .delay           = DEFAULT_DELAY, \
     .max_line_length = DEFAULT_MAX_LINE_LENGTH, \
     .max_clients     = DEFAULT_MAX_CLIENTS, \
+    .bind_family     = DEFAULT_BIND_FAMILY, \
 }
 
 static void
@@ -365,6 +348,27 @@ config_set_max_line_length(struct config *c, const char *s, int hardfail)
     }
 }
 
+static void
+config_set_bind_family(struct config *c, const char *s, int hardfail)
+{
+  switch (*s) {
+      case '4':
+          c->bind_family = AF_INET;
+          break;
+      case '6':
+          c->bind_family = AF_INET6;
+          break;
+      case '0':
+          c->bind_family = AF_UNSPEC;
+          break;
+      default:
+          fprintf(stderr, "endlessh: Invalid address family: %s\n", s);
+          if (hardfail)
+              exit(EXIT_FAILURE);
+          break;
+  }
+}
+
 enum config_key {
     KEY_INVALID,
     KEY_PORT,
@@ -372,6 +376,7 @@ enum config_key {
     KEY_MAX_LINE_LENGTH,
     KEY_MAX_CLIENTS,
     KEY_LOG_LEVEL,
+    KEY_BIND_FAMILY,
 };
 
 static enum config_key
@@ -383,6 +388,7 @@ config_key_parse(const char *tok)
         [KEY_MAX_LINE_LENGTH] = "MaxLineLength",
         [KEY_MAX_CLIENTS]     = "MaxClients",
         [KEY_LOG_LEVEL]       = "LogLevel",
+        [KEY_BIND_FAMILY]     = "BindFamily"
     };
     for (size_t i = 1; i < sizeof(table) / sizeof(*table); i++)
         if (!strcmp(tok, table[i]))
@@ -396,9 +402,8 @@ config_load(struct config *c, const char *file, int hardfail)
     long lineno = 0;
     FILE *f = fopen(file, "r");
     if (f) {
-        size_t len = 0;
-        char *line = 0;
-        while (getline(&line, &len, f) != -1) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
             lineno++;
 
             /* Remove comments */
@@ -450,6 +455,9 @@ config_load(struct config *c, const char *file, int hardfail)
                 case KEY_MAX_CLIENTS:
                     config_set_max_clients(c, tokens[1], hardfail);
                     break;
+                case KEY_BIND_FAMILY:
+                    config_set_bind_family(c, tokens[1], hardfail);
+                    break;
                 case KEY_LOG_LEVEL: {
                     errno = 0;
                     char *end;
@@ -465,7 +473,6 @@ config_load(struct config *c, const char *file, int hardfail)
             }
         }
 
-        free(line);
         fclose(f);
     }
 }
@@ -477,13 +484,19 @@ config_log(const struct config *c)
     logmsg(LOG_INFO, "Delay %ld", c->delay);
     logmsg(LOG_INFO, "MaxLineLength %d", c->max_line_length);
     logmsg(LOG_INFO, "MaxClients %d", c->max_clients);
+    logmsg(LOG_INFO, "BindFamily %s",
+        c->bind_family == AF_INET6 ? "IPv6 Only" :
+        c->bind_family == AF_INET  ? "IPv4 Only" :
+                                "IPv4 Mapped IPv6");
 }
 
 static void
 usage(FILE *f)
 {
-    fprintf(f, "Usage: endlessh [-vh] [-d MS] [-f CONFIG] [-l LEN] "
+    fprintf(f, "Usage: endlessh [-vh] [-46] [-d MS] [-f CONFIG] [-l LEN] "
                                "[-m LIMIT] [-p PORT]\n");
+    fprintf(f, "  -4        Bind to IPv4 only\n");
+    fprintf(f, "  -6        Bind to IPv6 only\n");
     fprintf(f, "  -d INT    Message millisecond delay ["
             XSTR(DEFAULT_DELAY) "]\n");
     fprintf(f, "  -f        Set and load config file ["
@@ -496,7 +509,7 @@ usage(FILE *f)
     fprintf(f, "  -p INT    Listening port [" XSTR(DEFAULT_PORT) "]\n");
     fprintf(f, "  -v        Print diagnostics to standard output "
             "(repeatable)\n");
-    fprintf(f, "  -v        Print version information and exit\n");
+    fprintf(f, "  -V        Print version information and exit\n");
 }
 
 static void
@@ -506,11 +519,11 @@ print_version(void)
 }
 
 static int
-server_create(int port)
+server_create(int port, int family)
 {
     int r, s, value;
 
-    s = socket(AF_INET6, SOCK_STREAM, 0);
+    s = socket(family == AF_UNSPEC ? AF_INET6 : family, SOCK_STREAM, 0);
     logmsg(LOG_DEBUG, "socket() = %d", s);
     if (s == -1) die();
 
@@ -521,12 +534,37 @@ server_create(int port)
     if (r == -1)
         logmsg(LOG_DEBUG, "errno = %d, %s", errno, strerror(errno));
 
-    struct sockaddr_in6 addr = {
-        .sin6_family = AF_INET6,
-        .sin6_port = htons(port),
-        .sin6_addr = in6addr_any
-    };
-    r = bind(s, (void *)&addr, sizeof(addr));
+    /*
+     * With OpenBSD IPv6 sockets are always IPv6-only, so the socket option
+     * is read-only (not modifiable).
+     * http://man.openbsd.org/ip6#IPV6_V6ONLY
+     */
+#ifndef __OpenBSD__
+    if (family == AF_INET6 || family == AF_UNSPEC) {
+        errno = 0;
+        value = (family == AF_INET6);
+        r = setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &value, sizeof(value));
+        logmsg(LOG_DEBUG, "setsockopt(%d, IPV6_V6ONLY, true) = %d", s, r);
+        if (r == -1)
+            logmsg(LOG_DEBUG, "errno = %d, %s", errno, strerror(errno));
+    }
+#endif
+
+    if (family == AF_INET) {
+        struct sockaddr_in addr4 = {
+            .sin_family = AF_INET,
+            .sin_port = htons(port),
+            .sin_addr = {INADDR_ANY}
+        };
+        r = bind(s, (void *)&addr4, sizeof(addr4));
+    } else {
+        struct sockaddr_in6 addr6 = {
+            .sin6_family = AF_INET6,
+            .sin6_port = htons(port),
+            .sin6_addr = in6addr_any
+        };
+        r = bind(s, (void *)&addr6, sizeof(addr6));
+    }
     logmsg(LOG_DEBUG, "bind(%d, port=%d) = %d", s, port, r);
     if (r == -1) die();
 
@@ -537,21 +575,68 @@ server_create(int port)
     return s;
 }
 
+/* Write a line to a client, returning client if it's still up. */
+static struct client *
+sendline(struct client *client, int max_line_length, unsigned long *rng)
+{
+    char line[256];
+    int len = randline(line, max_line_length, rng);
+    for (;;) {
+        ssize_t out = write(client->fd, line, len);
+        logmsg(LOG_DEBUG, "write(%d) = %d", client->fd, (int)out);
+        if (out == -1) {
+            if (errno == EINTR) {
+                continue;      /* try again */
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return client; /* don't care */
+            } else {
+                client_destroy(client);
+                return 0;
+            }
+        } else {
+            client->bytes_sent += out;
+            statistics.bytes_sent += out;
+            return client;
+        }
+    }
+}
+
+
 int
 main(int argc, char **argv)
 {
     struct config config = CONFIG_DEFAULT;
     const char *config_file = DEFAULT_CONFIG_FILE;
+
+#if defined(__OpenBSD__)
+    unveil(config_file, "r"); /* return ignored as the file may not exist */
+    if (pledge("inet stdio rpath unveil", 0) == -1)
+        die();
+#endif
+
     config_load(&config, config_file, 1);
 
     int option;
-    while ((option = getopt(argc, argv, "d:f:hl:m:p:vV")) != -1) {
+    while ((option = getopt(argc, argv, "46d:f:hl:m:p:vV")) != -1) {
         switch (option) {
+            case '4':
+                config_set_bind_family(&config, "4", 1);
+                break;
+            case '6':
+                config_set_bind_family(&config, "6", 1);
+                break;
             case 'd':
                 config_set_delay(&config, optarg, 1);
                 break;
             case 'f':
                 config_file = optarg;
+
+#if defined(__OpenBSD__)
+                unveil(config_file, "r");
+                if (unveil(0, 0) == -1)
+                    die();
+#endif
+
                 config_load(&config, optarg, 1);
                 break;
             case 'h':
@@ -568,8 +653,7 @@ main(int argc, char **argv)
                 config_set_port(&config, optarg, 1);
                 break;
             case 'v':
-                if (!loglevel++)
-                    setvbuf(stdout, 0, _IOLBF, 0);
+                loglevel++;
                 break;
             case 'V':
                 print_version();
@@ -585,6 +669,9 @@ main(int argc, char **argv)
         fprintf(stderr, "endlessh: too many arguments\n");
         exit(EXIT_FAILURE);
     }
+
+    /* Set output (log) to line buffered */
+    setvbuf(stdout, 0, _IOLBF, 0);
 
     /* Log configuration */
     config_log(&config);
@@ -603,53 +690,60 @@ main(int argc, char **argv)
         if (r == -1)
             die();
     }
+    {
+        struct sigaction sa = {.sa_handler = sigusr1_handler};
+        int r = sigaction(SIGUSR1, &sa, 0);
+        if (r == -1)
+            die();
+    }
 
-    struct queue queue[1];
-    queue_init(queue);
+    struct fifo fifo[1];
+    fifo_init(fifo);
 
-    struct pollvec pollvec[1];
-    pollvec_init(pollvec);
+    unsigned long rng = epochms();
 
-    unsigned long rng = uepoch();
-
-    int server = server_create(config.port);
+    int server = server_create(config.port, config.bind_family);
 
     while (running) {
         if (reload) {
             /* Configuration reload requested (SIGHUP) */
             int oldport = config.port;
+            int oldfamily = config.bind_family;
             config_load(&config, config_file, 0);
             config_log(&config);
-            if (oldport != config.port) {
+            if (oldport != config.port || oldfamily != config.bind_family) {
                 close(server);
-                server = server_create(config.port);
+                server = server_create(config.port, config.bind_family);
             }
             reload = 0;
         }
-
-        /* Enqueue the listening socket first */
-        pollvec_clear(pollvec);
-        if (queue->length < config.max_clients)
-            pollvec_push(pollvec, server, POLLIN);
-        else
-            pollvec_push(pollvec, -1, 0);
+        if (dumpstats) {
+            /* print stats requested (SIGUSR1) */
+            statistics_log_totals(fifo->head);
+            dumpstats = 0;
+        }
 
         /* Enqueue clients that are due for another message */
         int timeout = -1;
-        long long now = uepoch();
-        for (struct client *c = queue->head; c; c = c->next) {
-            if (c->send_next <= now) {
-                pollvec_push(pollvec, c->fd, POLLOUT);
+        long long now = epochms();
+        while (fifo->head) {
+            if (fifo->head->send_next <= now) {
+                struct client *c = fifo_pop(fifo);
+                if (sendline(c, config.max_line_length, &rng)) {
+                    c->send_next = now + config.delay;
+                    fifo_append(fifo, c);
+                }
             } else {
-                timeout = c->send_next - now;
+                timeout = fifo->head->send_next - now;
                 break;
             }
         }
 
         /* Wait for next event */
-        logmsg(LOG_DEBUG, "poll(%zu, %d)%s", pollvec->fill, timeout,
-                queue->length >= config.max_clients ? " (no accept)" : "");
-        int r = poll(pollvec->fds, pollvec->fill, timeout);
+        struct pollfd fds = {server, POLLIN, 0};
+        int nfds = fifo->length < config.max_clients;
+        logmsg(LOG_DEBUG, "poll(%d, %d)", nfds, timeout);
+        int r = poll(&fds, nfds, timeout);
         logmsg(LOG_DEBUG, "= %d", r);
         if (r == -1) {
             switch (errno) {
@@ -663,18 +757,19 @@ main(int argc, char **argv)
         }
 
         /* Check for new incoming connections */
-        if (pollvec->fds[0].revents & POLLIN) {
+        if (fds.revents & POLLIN) {
             int fd = accept(server, 0, 0);
             logmsg(LOG_DEBUG, "accept() = %d", fd);
+            statistics.connects++;
             if (fd == -1) {
                 const char *msg = strerror(errno);
                 switch (errno) {
                     case EMFILE:
                     case ENFILE:
-                        config.max_clients = queue->length;
+                        config.max_clients = fifo->length;
                         logmsg(LOG_INFO,
                                 "MaxClients %d",
-                                queue->length);
+                                fifo->length);
                         break;
                     case ECONNABORTED:
                     case EINTR:
@@ -688,51 +783,23 @@ main(int argc, char **argv)
                         exit(EXIT_FAILURE);
                 }
             } else {
-                long long send_next = uepoch() + config.delay / 2;
+                long long send_next = epochms() + config.delay;
                 struct client *client = client_new(fd, send_next);
+                int flags = fcntl(fd, F_GETFL, 0);      /* cannot fail */
+                fcntl(fd, F_SETFL, flags | O_NONBLOCK); /* cannot fail */
                 if (!client) {
                     fprintf(stderr, "endlessh: warning: out of memory\n");
                     close(fd);
-                }
-                queue_append(queue, client);
-                logmsg(LOG_INFO, "ACCEPT host=%s port=%d fd=%d n=%d/%d",
-                        client->ipaddr, client->port, client->fd,
-                        queue->length, config.max_clients);
-            }
-        }
-
-        /* Write lines to ready clients */
-        for (size_t i = 1; i < pollvec->fill; i++) {
-            short fd = pollvec->fds[i].fd;
-            short revents = pollvec->fds[i].revents;
-            struct client *client = queue_remove(queue, fd);
-
-            if (revents & POLLHUP) {
-                client_destroy(client);
-
-            } else if (revents & POLLOUT) {
-                char line[256];
-                int len = randline(line, config.max_line_length, &rng);
-                for (;;) {
-                    /* Don't really care if send is short */
-                    ssize_t out = send(fd, line, len, MSG_DONTWAIT);
-                    if (out == -1 && errno == EINTR) {
-                        continue;  /* try again */
-                    } else if (out == -1) {
-                        client_destroy(client);
-                        break;
-                    } else {
-                        logmsg(LOG_DEBUG, "send(%d) = %d", fd, (int)out);
-                        client->bytes_sent += out;
-                        client->send_next = uepoch() + config.delay;
-                        queue_append(queue, client);
-                        break;
-                    }
+                } else {
+                    fifo_append(fifo, client);
+                    logmsg(LOG_INFO, "ACCEPT host=%s port=%d fd=%d n=%d/%d",
+                            client->ipaddr, client->port, client->fd,
+                            fifo->length, config.max_clients);
                 }
             }
         }
     }
 
-    pollvec_free(pollvec);
-    queue_destroy(queue);
+    fifo_destroy(fifo);
+    statistics_log_totals(0);
 }

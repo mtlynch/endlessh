@@ -2,10 +2,10 @@
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/mtlynch/endlessh.svg?maxAge=604800)](https://hub.docker.com/r/mtlynch/endlessh/)
 
-Endlessh is an SSH tarpit that *very* slowly sends an endless, random
-SSH banner. It keeps SSH clients locked up for hours or even days at a
-time. The purpose is to put your real SSH server on another port and
-then let the script kiddies get stuck in this tarpit instead of
+Endlessh is an SSH tarpit [that *very* slowly sends an endless, random
+SSH banner][np]. It keeps SSH clients locked up for hours or even days
+at a time. The purpose is to put your real SSH server on another port
+and then let the script kiddies get stuck in this tarpit instead of
 bothering a real server.
 
 Since the tarpit is in the banner before any cryptographic exchange
@@ -13,12 +13,16 @@ occurs, this program doesn't depend on any cryptographic libraries. It's
 a simple, single-threaded, standalone C program. It uses `poll()` to
 trap multiple clients at a time.
 
+
+
 ## Usage
 
 Usage information is printed with `-h`.
 
 ```
 Usage: endlessh [-vh] [-d MS] [-f CONFIG] [-l LEN] [-m LIMIT] [-p PORT]
+  -4        Bind to IPv4 only
+  -6        Bind to IPv6 only
   -d INT    Message millisecond delay [10000]
   -f        Set and load config file [/etc/endlessh/config]
   -h        Print this help message and exit
@@ -42,6 +46,8 @@ A SIGTERM signal will gracefully shut down the daemon, allowing it to
 write a complete, consistent log.
 
 A SIGHUP signal requests a reload of the configuration file (`-f`).
+
+A SIGUSR1 signal will print connections stats to the log.
 
 ## Sample Configuration File
 
@@ -69,4 +75,40 @@ MaxClients 4096
 #   1 = Standard, useful log messages
 #   2 = Very noisy debugging information
 LogLevel 0
+
+# Set the family of the listening socket
+#   0 = Use IPv4 Mapped IPv6 (Both v4 and v6, default)
+#   4 = Use IPv4 only
+#   6 = Use IPv6 only
+BindFamily 0
 ```
+
+## Build issues
+
+Some more esoteric systems require extra configuration when building.
+
+### RHEL 6 / CentOS 6
+
+This system uses a version of glibc older than 2.17 (December 2012), and
+`clock_gettime(2)` is still in librt. For these systems you will need to
+link against librt:
+
+    make LDLIBS=-lrt
+
+### Solaris / illumos
+
+These systems don't include all the necessary functionality in libc and
+the linker requires some extra libraries:
+
+    make CC=gcc LDLIBS='-lnsl -lrt -lsocket'
+
+If you're not using GCC or Clang, also override `CFLAGS` and `LDFLAGS`
+to remove GCC-specific options. For example, on Solaris:
+
+    make CFLAGS=-fast LDFLAGS= LDLIBS='-lnsl -lrt -lsocket'
+
+The feature test macros on these systems isn't reliable, so you may also
+need to use `-D__EXTENSIONS__` in `CFLAGS`.
+
+
+[np]: https://nullprogram.com/blog/2019/03/22/
